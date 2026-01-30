@@ -301,11 +301,13 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
                     batch_conversation_templates.append(template)
 
-                # Simple tokenization
+                # Tokenization with padding for batch processing
                 model_inputs = self.hf_tokenizer(
                     batch_conversation_templates,
                     return_tensors="pt",
                     add_special_tokens=True,
+                    padding=True,
+                    truncation=True,
                 )
 
                 # Move to device if available
