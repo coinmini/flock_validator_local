@@ -488,6 +488,50 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
         return normalized
 
+    # Models whose APIs do not accept the "system" role
+    _NO_SYSTEM_ROLE_MODELS = {"minimax-m2.1"}
+
+    def _adapt_messages_for_model(
+            self, model_name: str, messages: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """
+        Adapt messages for models that don't support the 'system' role.
+        Merges system messages into the first user message as a prefix.
+        """
+        if model_name not in self._NO_SYSTEM_ROLE_MODELS:
+            return messages
+
+        system_parts = []
+        other_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_parts.append(msg["content"])
+            else:
+                other_messages.append(msg)
+
+        if not system_parts:
+            return messages
+
+        # Prepend system content to the first user message
+        system_text = "\n".join(system_parts)
+        adapted = []
+        prepended = False
+        for msg in other_messages:
+            if msg["role"] == "user" and not prepended:
+                adapted.append({
+                    "role": "user",
+                    "content": f"[System instruction]: {system_text}\n\n{msg['content']}",
+                })
+                prepended = True
+            else:
+                adapted.append(msg)
+
+        # If no user message found, add system as user message
+        if not prepended:
+            adapted.insert(0, {"role": "user", "content": system_text})
+
+        return adapted
+
     def _call_gpt(
             self, messages: List[Dict[str, str]], eval_args: dict
     ) -> tuple[str, str]:
@@ -515,9 +559,13 @@ class LLMJudgeValidationModule(BaseValidationModule):
         # Resolve the actual API model name (may differ from eval_model_list name)
         api_model_name = self.model_name_map.get(selected_model, selected_model)
 
+        # Some APIs (e.g. MiniMax) don't support "system" role.
+        # Merge system messages into the first user message.
+        adapted_messages = self._adapt_messages_for_model(selected_model, messages)
+
         params = {
             "model": api_model_name,
-            "messages": messages,
+            "messages": adapted_messages,
             "temperature": temperature,
             "seed": random.randint(0, 10000),
         }
