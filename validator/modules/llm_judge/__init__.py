@@ -65,42 +65,138 @@ class LLMJudgeValidationModule(BaseValidationModule):
         super().__init__(config, **kwargs)
         self.config = config
         self.client = None
+        self.model_clients = {}  # model_name -> OpenAI client
+        self.model_name_map = {}  # model_name -> actual API model name
         self.available_models = []
         self.hf_model = None
         self.hf_tokenizer = None
         self.skip_llm_eval = skip_llm_eval
 
         if not skip_llm_eval:
-            # Initialize client and get available models
+            # Initialize clients (default + per-model overrides)
             self._initialize_client()
+            self._initialize_model_clients()
             self._fetch_available_models()
 
     def _initialize_client(self):
+        """Initialize the default OpenAI client from OPENAI_BASE_URL / OPENAI_API_KEY."""
+        base_url = os.getenv("OPENAI_BASE_URL")
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not base_url or not api_key:
+            logger.warning("Default OPENAI_BASE_URL/OPENAI_API_KEY not set, skipping default client")
+            return
         try:
             http_client = httpx.Client(
-                base_url=os.getenv("OPENAI_BASE_URL"),
-                headers={"Authorization": f"Bearer {os.getenv('OPENAI_API_KEY')}"},
+                base_url=base_url,
+                headers={"Authorization": f"Bearer {api_key}"},
             )
 
             self.client = OpenAI(
-                api_key=os.getenv("OPENAI_API_KEY"),
-                base_url=os.getenv("OPENAI_BASE_URL"),
+                api_key=api_key,
+                base_url=base_url,
                 http_client=http_client,
             )
 
         except Exception as e:
-            raise LLMJudgeException(f"OPENAI_API_KEY and OPENAI_BASE_URL are not set in the environment variables: {e}") from e
+            raise LLMJudgeException(f"Failed to initialize default OpenAI client: {e}") from e
+
+    def _create_openai_client(self, base_url: str, api_key: str) -> OpenAI:
+        """Create an OpenAI client for a specific endpoint."""
+        http_client = httpx.Client(
+            base_url=base_url,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+
+    def _initialize_model_clients(self):
+        """
+        Initialize per-model OpenAI clients from environment variables.
+
+        Env var pattern (prefix-based):
+            <PREFIX>_BASE_URL=https://api.example.com/v1
+            <PREFIX>_API_KEY=sk-xxx
+            <PREFIX>_MODELS=model-a,model-b
+            <PREFIX>_MODEL_MAP=model-a:actual-api-name  (optional)
+
+        Supported prefixes: KIMI, DEEPSEEK, MINIMAX (and any custom prefix).
+        The module scans for all *_MODELS env vars and creates a client for
+        each model listed, mapping it in self.model_clients.
+
+        If the platform uses a different model name than the one used in
+        eval_model_list, set <PREFIX>_MODEL_MAP to remap. Format is
+        comma-separated pairs of "local_name:api_name".
+        Example: DEEPSEEK_MODEL_MAP=deepseek-v3.2:deepseek-chat
+        """
+        # Scan env vars for *_MODELS pattern
+        model_env_prefixes = set()
+        for key in os.environ:
+            if key.endswith("_MODELS") and key != "MODELS":
+                prefix = key[: -len("_MODELS")]
+                model_env_prefixes.add(prefix)
+
+        for prefix in sorted(model_env_prefixes):
+            base_url = os.getenv(f"{prefix}_BASE_URL")
+            api_key = os.getenv(f"{prefix}_API_KEY")
+            models_str = os.getenv(f"{prefix}_MODELS", "")
+
+            if not base_url or not api_key:
+                logger.warning(f"Skipping {prefix}: missing {prefix}_BASE_URL or {prefix}_API_KEY")
+                continue
+
+            models = [m.strip() for m in models_str.split(",") if m.strip()]
+            if not models:
+                continue
+
+            # Parse optional model name mapping
+            model_map_str = os.getenv(f"{prefix}_MODEL_MAP", "")
+            if model_map_str:
+                for mapping in model_map_str.split(","):
+                    mapping = mapping.strip()
+                    if ":" in mapping:
+                        local_name, api_name = mapping.split(":", 1)
+                        self.model_name_map[local_name.strip()] = api_name.strip()
+                        logger.info(f"Model name mapping: '{local_name.strip()}' -> '{api_name.strip()}'")
+
+            try:
+                client = self._create_openai_client(base_url, api_key)
+                for model_name in models:
+                    self.model_clients[model_name] = client
+                    logger.info(f"Registered model '{model_name}' -> {base_url} (prefix: {prefix})")
+            except Exception as e:
+                logger.error(f"Failed to create client for {prefix}: {e}")
+
+    def _get_client_for_model(self, model_name: str) -> OpenAI:
+        """Return the OpenAI client for a given model, falling back to the default client."""
+        if model_name in self.model_clients:
+            return self.model_clients[model_name]
+        if self.client is not None:
+            return self.client
+        raise LLMJudgeException(
+            f"No API client available for model '{model_name}'. "
+            f"Set {model_name.upper().replace('-', '_')}_BASE_URL / _API_KEY / _MODELS in .env, "
+            f"or set the default OPENAI_BASE_URL / OPENAI_API_KEY."
+        )
 
     def _fetch_available_models(self):
-        try:
-            models_response = self.client.models.list()
-            self.available_models = [model.id for model in models_response.data]
+        # Start with models that have dedicated clients
+        self.available_models = list(self.model_clients.keys())
 
-        except Exception as e:
-            # Fallback to common models if API call fails
-            logger.error(
-                f"Warning: Failed to fetch models from API ({e}), using fallback models"
-            )
+        # Also fetch models from the default client
+        if self.client is not None:
+            try:
+                models_response = self.client.models.list()
+                default_models = [model.id for model in models_response.data]
+                # Merge, avoiding duplicates
+                for m in default_models:
+                    if m not in self.available_models:
+                        self.available_models.append(m)
+            except Exception as e:
+                logger.error(
+                    f"Warning: Failed to fetch models from default API ({e})"
+                )
+
+        if not self.available_models:
+            logger.warning("No evaluation models available")
             self.available_models = ["gpt-4o"]
 
     def _download_lora_config(self, repo_id: str, revision: str) -> bool:
@@ -416,8 +512,11 @@ class LLMJudgeValidationModule(BaseValidationModule):
         if selected_model == "kimi-k2.5":
             temperature = 1
 
+        # Resolve the actual API model name (may differ from eval_model_list name)
+        api_model_name = self.model_name_map.get(selected_model, selected_model)
+
         params = {
-            "model": selected_model,
+            "model": api_model_name,
             "messages": messages,
             "temperature": temperature,
             "seed": random.randint(0, 10000),
@@ -436,7 +535,8 @@ class LLMJudgeValidationModule(BaseValidationModule):
             reraise=True,
         )
         def _make_api_call():
-            completion = self.client.chat.completions.create(**params)
+            client = self._get_client_for_model(selected_model)
+            completion = client.chat.completions.create(**params)
             return completion.choices[0].message.content
 
         try:
@@ -945,6 +1045,18 @@ class LLMJudgeValidationModule(BaseValidationModule):
             except Exception:
                 pass
         self.client = None
+
+        # Close per-model clients
+        closed = set()
+        for model_name, client in self.model_clients.items():
+            client_id = id(client)
+            if client_id not in closed and hasattr(client, "http_client"):
+                try:
+                    client.http_client.close()
+                except Exception:
+                    pass
+                closed.add(client_id)
+        self.model_clients.clear()
 
         # Clean up HuggingFace model resources
         if self.hf_model is not None:
