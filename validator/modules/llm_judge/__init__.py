@@ -167,8 +167,16 @@ class LLMJudgeValidationModule(BaseValidationModule):
             )
             raise InvalidModelParametersException(f"Model parameters {total} exceed limit {max_params}")
 
-    def _load_local_model(self, model_path: str, is_lora: bool = False, max_params: int = None):
-        """Load a model from a local directory path (no HuggingFace download)."""
+    def _load_local_model(self, model_path: str, is_lora: bool = False, max_params: int = None, base_model_path: str = None):
+        """Load a model from a local directory path (no HuggingFace download).
+
+        Args:
+            model_path: Path to the model or LoRA adapter directory.
+            is_lora: Whether the model is a LoRA adapter.
+            max_params: Maximum allowed parameters (skip check if None).
+            base_model_path: Local path to the base model for LoRA. If not provided,
+                uses base_model_name_or_path from adapter_config.json.
+        """
         model_kwargs = dict(
             trust_remote_code=True,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
@@ -176,12 +184,15 @@ class LLMJudgeValidationModule(BaseValidationModule):
             device_map="auto",
         )
         if is_lora:
-            adapter_config_path = os.path.join(model_path, "adapter_config.json")
-            if not os.path.exists(adapter_config_path):
-                raise LLMJudgeException(f"adapter_config.json not found at {adapter_config_path}")
-            with open(adapter_config_path, "r") as f:
-                adapter_config = json.load(f)
-            base_model = adapter_config["base_model_name_or_path"]
+            if base_model_path:
+                base_model = base_model_path
+            else:
+                adapter_config_path = os.path.join(model_path, "adapter_config.json")
+                if not os.path.exists(adapter_config_path):
+                    raise LLMJudgeException(f"adapter_config.json not found at {adapter_config_path}")
+                with open(adapter_config_path, "r") as f:
+                    adapter_config = json.load(f)
+                base_model = adapter_config["base_model_name_or_path"]
             logger.info(f"Loading LoRA adapter from {model_path}, base model: {base_model}")
             self.hf_tokenizer = AutoTokenizer.from_pretrained(
                 base_model, trust_remote_code=True, use_fast=True
@@ -814,6 +825,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
         max_params: int = None,
         eval_args: dict = None,
         is_lora: bool = False,
+        base_model_path: str = None,
     ) -> dict:
         """
         Run validation locally without FLock API.
@@ -829,7 +841,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
         # Stage 0: Load model from local path
         logger.info(f"Loading model from {model_path}...")
         try:
-            self._load_local_model(model_path, is_lora=is_lora, max_params=max_params)
+            self._load_local_model(model_path, is_lora=is_lora, max_params=max_params, base_model_path=base_model_path)
         except InvalidModelParametersException as e:
             logger.info(f"Invalid model parameters: {e}")
             return {"num_conversations": 0, "score": LOWEST_POSSIBLE_SCORE}

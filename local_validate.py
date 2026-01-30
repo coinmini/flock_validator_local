@@ -30,9 +30,11 @@ from validator.modules.llm_judge import LLMJudgeValidationModule, LLMJudgeConfig
               help='Evaluation parallelism (number of workers)')
 @click.option('--is-lora', is_flag=True, default=False,
               help='Model is a LoRA adapter (expects adapter_config.json in model-path)')
+@click.option('--base-model-path', type=click.Path(exists=True), default=None,
+              help='Local path to base model for LoRA (overrides adapter_config.json base_model_name_or_path)')
 def main(model_path, validation_file, base_model, context_length, max_params,
          eval_with_llm, eval_model, prompt_id, output_format,
-         gen_batch_size, eval_batch_size, is_lora):
+         gen_batch_size, eval_batch_size, is_lora, base_model_path):
     """
     Run LLM Judge validation locally against a model on disk.
     No FLock API or HuggingFace token required.
@@ -62,6 +64,7 @@ def main(model_path, validation_file, base_model, context_length, max_params,
             max_params=max_params,
             eval_args=eval_args,
             is_lora=is_lora,
+            base_model_path=base_model_path,
         )
 
         if output_format == 'json':
