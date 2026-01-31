@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from loguru import logger
 from huggingface_hub import HfApi
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Generator
 from validator.modules.llm_judge.prompt import get_prompt
 from validator.modules.llm_judge.utils import download_file
 from validator.exceptions import LLMJudgeException, InvalidModelParametersException
@@ -87,7 +87,6 @@ class LLMJudgeValidationModule(BaseValidationModule):
             return
         try:
             http_client = httpx.Client(
-                base_url=base_url,
                 headers={"Authorization": f"Bearer {api_key}"},
             )
 
@@ -103,7 +102,6 @@ class LLMJudgeValidationModule(BaseValidationModule):
     def _create_openai_client(self, base_url: str, api_key: str) -> OpenAI:
         """Create an OpenAI client for a specific endpoint."""
         http_client = httpx.Client(
-            base_url=base_url,
             headers={"Authorization": f"Bearer {api_key}"},
         )
         return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
@@ -444,6 +442,80 @@ class LLMJudgeValidationModule(BaseValidationModule):
         except Exception as e:
             raise LLMJudgeException(f"Failed to generate response: {e}") from e
 
+    def _generate_response_batched(
+            self,
+            context_length: int,
+            user_input: list,
+            base_model: str = "default",
+            max_length: int = 2048,
+            batch_size: int = 1,
+            eval_args: dict = None,
+    ) -> Generator[tuple, None, None]:
+        """Generate responses in batches, yielding (start_index, batch_responses) per batch.
+
+        This allows the caller to evaluate each batch immediately after generation,
+        enabling early detection of API configuration issues.
+        """
+        if self.hf_model is None or self.hf_tokenizer is None:
+            raise LLMJudgeException("HuggingFace model not loaded")
+
+        try:
+            total_batches = (len(user_input) + batch_size - 1) // batch_size
+            for batch_idx, i in enumerate(range(0, len(user_input), batch_size), 1):
+                batch_conversations = user_input[i: i + batch_size]
+
+                # Apply chat template with fallback
+                batch_conversation_templates = []
+                for conversation in batch_conversations:
+                    template = self._construct_conversation_template(
+                        conversation, base_model=base_model,
+                    )
+                    batch_conversation_templates.append(template)
+
+                # Tokenization with padding for batch processing
+                model_inputs = self.hf_tokenizer(
+                    batch_conversation_templates,
+                    return_tensors="pt",
+                    add_special_tokens=True,
+                    padding=True,
+                    truncation=True,
+                )
+
+                # Move to device if available
+                if (
+                        torch.cuda.is_available()
+                        and next(self.hf_model.parameters()).is_cuda
+                ):
+                    model_inputs = {k: v.cuda() for k, v in model_inputs.items()}
+
+                logger.info(f"Generating batch {batch_idx}/{total_batches} ({min(i + batch_size, len(user_input))}/{len(user_input)} conversations)...")
+                with torch.no_grad():
+                    outputs = self.hf_model.generate(
+                        **model_inputs,
+                        max_new_tokens=max_length,
+                        temperature=self.config.gen_temperature,
+                        do_sample=True,
+                        pad_token_id=self.hf_tokenizer.eos_token_id,
+                        eos_token_id=self.hf_tokenizer.eos_token_id,
+                    )
+
+                # Decode responses
+                batch_results = []
+                for j, output in enumerate(outputs):
+                    input_length = model_inputs["input_ids"][j].shape[0]
+                    generated_ids = output[input_length:]
+                    assistant_response = self.hf_tokenizer.decode(
+                        generated_ids, skip_special_tokens=True
+                    ).strip()
+                    batch_results.append(assistant_response)
+
+                yield (i, batch_results)
+
+            logger.info(f"Completed generating all {len(user_input)} conversations")
+
+        except Exception as e:
+            raise LLMJudgeException(f"Failed to generate response: {e}") from e
+
     def _select_eval_model(self, eval_args: dict) -> str:
         """
         Select evaluation model based on eval_args configuration
@@ -563,6 +635,20 @@ class LLMJudgeValidationModule(BaseValidationModule):
         # Merge system messages into the first user message.
         adapted_messages = self._adapt_messages_for_model(selected_model, messages)
 
+        # Safety check: ensure no system role for models that don't support it
+        if selected_model in self._NO_SYSTEM_ROLE_MODELS:
+            has_system = any(m["role"] == "system" for m in adapted_messages)
+            if has_system:
+                logger.warning(
+                    f"System role still present after adaptation for {selected_model}, force-removing"
+                )
+                adapted_messages = [m for m in adapted_messages if m["role"] != "system"]
+
+        logger.debug(
+            f"API call to '{selected_model}' (api_name='{api_model_name}'): "
+            f"roles={[m['role'] for m in adapted_messages]}"
+        )
+
         params = {
             "model": api_model_name,
             "messages": adapted_messages,
@@ -595,18 +681,8 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 f"API call failed with model {selected_model} after retries: {e}"
             )
 
-    def _load_jsonl_conversations(
-            self,
-            base_model: str,
-            test_file: str,
-            eval_args: dict,
-            context_length: int
-    ) -> List[Dict[str, Any]]:
-
-        # Extract parameters from eval_args
-        max_gen_try = eval_args.get("gen_require", 1)  # Default max generation tries
-
-        # Parse all input conversations first
+    def _parse_jsonl_conversations(self, test_file: str) -> List[Dict[str, Any]]:
+        """Parse JSONL file into conversation structures without generating responses."""
         input_conversations = []
 
         with open(test_file, "r", encoding="utf-8") as f:
@@ -678,15 +754,47 @@ class LLMJudgeValidationModule(BaseValidationModule):
         if not input_conversations:
             raise LLMJudgeException("No valid conversations were found")
 
+        return input_conversations
+
+    def _build_conversation_result(
+            self, input_item: Dict[str, Any], assistant_response: str,
+            gen_try: int, max_gen_try: int
+    ) -> Dict[str, Any]:
+        """Build evaluation-ready conversation structure from input and generated response."""
+        final_conversations = (
+                [
+                    {
+                        "role": "system",
+                        "content": input_item["conversation"]["system"],
+                    }
+                ]
+                + input_item["conversation"]["conversations"]
+                + [{"role": "assistant", "content": assistant_response}]
+        )
+        return {
+            "conversations": final_conversations,
+            "generation_index": gen_try,
+            "total_generations": max_gen_try,
+            "reference": input_item.get("reference"),
+        }
+
+    def _load_jsonl_conversations(
+            self,
+            base_model: str,
+            test_file: str,
+            eval_args: dict,
+            context_length: int
+    ) -> List[Dict[str, Any]]:
+        """Parse JSONL and generate all responses. Used by validate() for backward compatibility."""
+        max_gen_try = eval_args.get("gen_require", 1)
+        input_conversations = self._parse_jsonl_conversations(test_file)
+
         generated_conversations = []
 
-        # Generate responses for each input conversation
         for gen_try in range(max_gen_try):
             logger.info(f"Generation attempt {gen_try + 1}/{max_gen_try} for {len(input_conversations)} conversations...")
-            # Prepare batch of conversations for generation
             batch_conversations = [item["conversation"] for item in input_conversations]
 
-            # Generate responses using batch processing
             assistant_responses = self._generate_response(
                 user_input=batch_conversations,
                 base_model=base_model,
@@ -695,29 +803,12 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 context_length=context_length,
             )
 
-            # Create conversation structures for this generation
             for input_item, assistant_response in zip(
                     input_conversations, assistant_responses
             ):
-                # Create final conversation with assistant response
-                final_conversations = (
-                        [
-                            {
-                                "role": "system",
-                                "content": input_item["conversation"]["system"],
-                            }
-                        ]
-                        + input_item["conversation"]["conversations"]
-                        + [{"role": "assistant", "content": assistant_response}]
+                conversation = self._build_conversation_result(
+                    input_item, assistant_response, gen_try, max_gen_try
                 )
-
-                # Create conversation structure for this generation
-                conversation = {
-                    "conversations": final_conversations,
-                    "generation_index": gen_try,
-                    "total_generations": max_gen_try,
-                    "reference": input_item.get("reference"),
-                }
                 generated_conversations.append(conversation)
 
         if not generated_conversations:
@@ -764,8 +855,8 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
         system_prompt = """You are a fair judge, please output the score, confidence, and reasoning for the given conversation."""
         return [
-            {"role": "user", "content": user_message},
             {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
         ]
 
     def _parse_llm_response(self, response: str, model_name: str = None) -> Dict[str, Any]:
@@ -996,75 +1087,96 @@ class LLMJudgeValidationModule(BaseValidationModule):
             logger.info(f"Invalid model parameters: {e}")
             return {"num_conversations": 0, "score": LOWEST_POSSIBLE_SCORE}
 
-        # Stage 1: Generate responses
-        logger.info("Stage 1: Generating conversations...")
-        all_conversations = self._load_jsonl_conversations(
-            base_model, validation_file, eval_args, context_length
-        )
-        logger.info(f"Generated {len(all_conversations)} conversations")
+        # Parse conversations from file (no generation yet)
+        input_conversations = self._parse_jsonl_conversations(validation_file)
+        logger.info(f"Parsed {len(input_conversations)} conversations from {validation_file}")
+
+        max_gen_try = eval_args.get("gen_require", 1)
+        max_eval_try = eval_args.get("eval_require", 1)
+        eval_batch_size = self.config.eval_batch_size
+
+        # Resolve available eval models once
+        if not self.skip_llm_eval:
+            eval_model_list = eval_args.get("eval_model_list", [])
+            available_eval_models = [
+                m for m in eval_model_list if m in self.available_models
+            ]
+            if not available_eval_models:
+                available_eval_models = self.available_models
+            logger.info(f"Evaluation models: {available_eval_models}")
+
+        all_conversations = []
+        all_weighted_scores = []
+        all_reasoning = []
+        pipeline_batch_num = 0
+
+        # Pipeline: generate 1 batch -> evaluate immediately -> next batch
+        for gen_try in range(max_gen_try):
+            logger.info(f"Generation attempt {gen_try + 1}/{max_gen_try} for {len(input_conversations)} conversations...")
+            batch_conversations = [item["conversation"] for item in input_conversations]
+
+            for start_idx, batch_responses in self._generate_response_batched(
+                user_input=batch_conversations,
+                base_model=base_model,
+                batch_size=self.config.gen_batch_size,
+                eval_args=eval_args,
+                context_length=context_length,
+            ):
+                pipeline_batch_num += 1
+
+                # Build conversation structures for this batch
+                batch_conv_data = []
+                for j, response in enumerate(batch_responses):
+                    input_item = input_conversations[start_idx + j]
+                    conv_data = self._build_conversation_result(
+                        input_item, response, gen_try, max_gen_try
+                    )
+                    batch_conv_data.append(conv_data)
+                    all_conversations.append(conv_data)
+
+                # Evaluate this batch immediately (if LLM eval enabled)
+                if not self.skip_llm_eval:
+                    logger.info(
+                        f"Pipeline batch {pipeline_batch_num}: evaluating "
+                        f"{len(batch_conv_data)} conversations with {len(available_eval_models)} models..."
+                    )
+
+                    eval_tasks = [
+                        (conv, eval_args, max_eval_try, start_idx + j)
+                        for j, conv in enumerate(batch_conv_data)
+                    ]
+
+                    with ThreadPoolExecutor(max_workers=eval_batch_size) as executor:
+                        futures = {
+                            executor.submit(self._evaluate_single_conversation, *t): t
+                            for t in eval_tasks
+                        }
+                        for future in as_completed(futures):
+                            try:
+                                eval_result = future.result()
+                            except Exception as e:
+                                logger.error(f"Evaluation failed: {e}")
+                                eval_result = {
+                                    "scores": [5.0], "confidences": [0.5],
+                                    "reasoning": ["Evaluation failed"],
+                                }
+
+                            scores = eval_result.get("scores", [])
+                            confidences = eval_result.get("confidences", [])
+                            if scores and confidences:
+                                for s, c in zip(scores, confidences):
+                                    all_weighted_scores.append(s * c)
+                            if eval_result.get("reasoning"):
+                                all_reasoning.extend(eval_result["reasoning"])
+
+        logger.info(f"Pipeline complete: {len(all_conversations)} conversations generated and evaluated")
 
         result = {
             "num_conversations": len(all_conversations),
             "conversations": all_conversations,
         }
 
-        # Stage 2: LLM-as-judge evaluation (optional)
         if not self.skip_llm_eval:
-            logger.info("Stage 2: Running LLM-as-judge evaluation...")
-            max_eval_try = eval_args.get("eval_require", 1)
-            eval_batch_size = self.config.eval_batch_size
-
-            eval_model_list = eval_args.get("eval_model_list", [])
-            available_eval_models = [
-                model for model in eval_model_list if model in self.available_models
-            ]
-            if not available_eval_models:
-                available_eval_models = self.available_models
-
-            total_eval_calls = len(all_conversations) * len(available_eval_models) * max_eval_try
-            logger.info(
-                f"Evaluating {len(all_conversations)} conversations with "
-                f"{len(available_eval_models)} models, {max_eval_try} tries each = "
-                f"{total_eval_calls} total evaluations"
-            )
-
-            evaluation_tasks = []
-            for idx, conversation_data in enumerate(all_conversations):
-                evaluation_tasks.append((conversation_data, eval_args, max_eval_try, idx))
-
-            with ThreadPoolExecutor(max_workers=eval_batch_size) as executor:
-                future_to_task = {
-                    executor.submit(self._evaluate_single_conversation, *task): task
-                    for task in evaluation_tasks
-                }
-                evaluation_results = []
-                completed_count = 0
-                total_tasks = len(evaluation_tasks)
-                for future in as_completed(future_to_task):
-                    try:
-                        eval_result = future.result()
-                        evaluation_results.append(eval_result)
-                        completed_count += 1
-                        logger.info(f"Evaluation progress: {completed_count}/{total_tasks}")
-                    except Exception as e:
-                        logger.error(f"Evaluation task failed: {e}")
-                        completed_count += 1
-                        evaluation_results.append({
-                            "scores": [5.0], "confidences": [0.5],
-                            "reasoning": ["Evaluation failed"]
-                        })
-
-            all_weighted_scores = []
-            all_reasoning = []
-            for eval_result in evaluation_results:
-                scores = eval_result.get("scores", [])
-                confidences = eval_result.get("confidences", [])
-                if scores and confidences:
-                    for s, c in zip(scores, confidences):
-                        all_weighted_scores.append(s * c)
-                if eval_result.get("reasoning"):
-                    all_reasoning.extend(eval_result["reasoning"])
-
             raw_avg_score = (
                 sum(all_weighted_scores) / len(all_weighted_scores)
                 if all_weighted_scores else 5.0
