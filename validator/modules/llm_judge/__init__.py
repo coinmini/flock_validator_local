@@ -204,6 +204,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 filename="adapter_config.json",
                 local_dir="judge",
                 revision=revision,
+                force_download=True,
             )
         except Exception as e:
             if "adapter_config.json" in str(e):
@@ -216,9 +217,22 @@ class LLMJudgeValidationModule(BaseValidationModule):
     def _load_model(self, repo_id: str, revision: str = "main", max_params: int = None):
 
         is_lora = self._download_lora_config(repo_id, revision=revision)
+
+        # Determine best dtype: prefer BF16 for numerical stability, fallback to FP16
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                compute_dtype = torch.bfloat16
+                logger.info("Using bfloat16 for better numerical stability")
+            else:
+                compute_dtype = torch.float16
+                logger.info("Using float16 (bfloat16 not supported on this GPU)")
+        else:
+            compute_dtype = torch.float32
+            logger.info("Using float32 (CPU mode)")
+
         model_kwargs = dict(
             trust_remote_code=True,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=compute_dtype,
             use_cache=False,
             device_map="auto",
         )
@@ -227,12 +241,13 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 repo_id=repo_id,
                 local_dir="judge",
                 revision=revision,
+                force_download=True,
             )
             with open("judge/adapter_config.json", "r") as f:
                 adapter_config = json.load(f)
             base_model = adapter_config["base_model_name_or_path"]
             self.hf_tokenizer = AutoTokenizer.from_pretrained(
-                base_model, trust_remote_code=True, use_fast=True
+                base_model, trust_remote_code=True, use_fast=True, padding_side='left'
             )
             base_hf_model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
             hf_model = PeftModel.from_pretrained(
@@ -243,13 +258,11 @@ class LLMJudgeValidationModule(BaseValidationModule):
             self.hf_model = hf_model.merge_and_unload()
         else:
             self.hf_tokenizer = AutoTokenizer.from_pretrained(
-                repo_id, trust_remote_code=True, use_fast=True
+                repo_id, trust_remote_code=True, use_fast=True, padding_side='left'
             )
             self.hf_model = AutoModelForCausalLM.from_pretrained(
                 repo_id,
-                torch_dtype=(
-                    torch.float16 if torch.cuda.is_available() else torch.float32
-                ),
+                torch_dtype=compute_dtype,
                 device_map=None,
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
@@ -271,9 +284,21 @@ class LLMJudgeValidationModule(BaseValidationModule):
             base_model_path: Local path to the base model for LoRA. If not provided,
                 uses base_model_name_or_path from adapter_config.json.
         """
+        # Determine best dtype: prefer BF16 for numerical stability, fallback to FP16
+        if torch.cuda.is_available():
+            if torch.cuda.is_bf16_supported():
+                compute_dtype = torch.bfloat16
+                logger.info("Using bfloat16 for better numerical stability")
+            else:
+                compute_dtype = torch.float16
+                logger.info("Using float16 (bfloat16 not supported on this GPU)")
+        else:
+            compute_dtype = torch.float32
+            logger.info("Using float32 (CPU mode)")
+
         model_kwargs = dict(
             trust_remote_code=True,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            torch_dtype=compute_dtype,
             use_cache=False,
             device_map="auto",
         )
@@ -289,7 +314,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 base_model = adapter_config["base_model_name_or_path"]
             logger.info(f"Loading LoRA adapter from {model_path}, base model: {base_model}")
             self.hf_tokenizer = AutoTokenizer.from_pretrained(
-                base_model, trust_remote_code=True, use_fast=True
+                base_model, trust_remote_code=True, use_fast=True, padding_side='left'
             )
             base_hf_model = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
             hf_model = PeftModel.from_pretrained(
@@ -299,11 +324,11 @@ class LLMJudgeValidationModule(BaseValidationModule):
         else:
             logger.info(f"Loading model from local path: {model_path}")
             self.hf_tokenizer = AutoTokenizer.from_pretrained(
-                model_path, trust_remote_code=True, use_fast=True
+                model_path, trust_remote_code=True, use_fast=True, padding_side='left'
             )
             self.hf_model = AutoModelForCausalLM.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                torch_dtype=compute_dtype,
                 device_map=None,
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
@@ -328,6 +353,16 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
             conversation_parts = []
 
+            # Validate conversation structure
+            if not isinstance(conversation, dict):
+                raise LLMJudgeException(f"Conversation must be a dict, got {type(conversation)}")
+
+            if "conversations" not in conversation:
+                raise LLMJudgeException("Conversation dict must have 'conversations' key")
+
+            if not conversation["conversations"]:
+                raise LLMJudgeException("Conversation 'conversations' list is empty")
+
             # Use provided system_text or fall back to template default
             if template.system_format:
                 system_prompt = (
@@ -342,22 +377,31 @@ class LLMJudgeValidationModule(BaseValidationModule):
                     )
                     conversation_parts.append(formatted_system)
 
-                # Multi-turn conversation: format each message according to template
-                for msg in conversation["conversations"]:
-                    if msg["role"] == "user":
-                        user_text = template.user_format.format(
-                            content=msg["content"],
-                            stop_token=self.hf_tokenizer.eos_token,
-                        )
-                        conversation_parts.append(user_text)
-                    elif msg["role"] == "assistant":
-                        assistant_text = template.assistant_format.format(
-                            content=msg["content"],
-                            stop_token=self.hf_tokenizer.eos_token,
-                        )
-                        conversation_parts.append(assistant_text)
+            # Multi-turn conversation: format each message according to template
+            for msg in conversation["conversations"]:
+                if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+                    logger.warning(f"Skipping invalid message: {msg}")
+                    continue
+
+                if msg["role"] == "user":
+                    user_text = template.user_format.format(
+                        content=msg["content"],
+                        stop_token=self.hf_tokenizer.eos_token,
+                    )
+                    conversation_parts.append(user_text)
+                elif msg["role"] == "assistant":
+                    assistant_text = template.assistant_format.format(
+                        content=msg["content"],
+                        stop_token=self.hf_tokenizer.eos_token,
+                    )
+                    conversation_parts.append(assistant_text)
 
             conversation_format = "".join(conversation_parts)
+
+            if not conversation_format.strip():
+                logger.error(f"Empty template generated. Template: {base_model}, Conversation: {conversation}, Parts: {conversation_parts}")
+                raise LLMJudgeException("Generated conversation template is empty after formatting")
+
         except Exception as e:
             raise LLMJudgeException(
                 f"Failed to construct conversation template: {e}"
@@ -393,16 +437,30 @@ class LLMJudgeValidationModule(BaseValidationModule):
                         conversation, base_model=base_model,
                     )
 
+                    # Validate template is not empty
+                    if not template or not template.strip():
+                        logger.error(f"Empty template generated for conversation: {conversation}")
+                        raise LLMJudgeException("Empty conversation template generated")
+
                     batch_conversation_templates.append(template)
 
-                # Tokenization with padding for batch processing
+                # Only pad when batch_size > 1 to avoid unnecessary overhead
                 model_inputs = self.hf_tokenizer(
                     batch_conversation_templates,
                     return_tensors="pt",
                     add_special_tokens=True,
-                    padding=True,
+                    padding=(batch_size > 1),
                     truncation=True,
                 )
+
+                # Validate tokenization results
+                if "input_ids" not in model_inputs or model_inputs["input_ids"].size(0) == 0:
+                    logger.error(f"Tokenization failed for batch {batch_idx}. Templates: {batch_conversation_templates}")
+                    raise LLMJudgeException(f"Tokenization produced empty input_ids for batch {batch_idx}")
+
+                if model_inputs["input_ids"].size(1) == 0:
+                    logger.error(f"Tokenization produced empty sequences for batch {batch_idx}. Templates: {batch_conversation_templates}")
+                    raise LLMJudgeException(f"Tokenization produced empty sequences for batch {batch_idx}")
 
                 # Move to device if available
                 if (
@@ -418,23 +476,50 @@ class LLMJudgeValidationModule(BaseValidationModule):
                         max_new_tokens=max_length,
                         temperature=self.config.gen_temperature,
                         do_sample=True,
+                        top_p=0.95,
+                        top_k=50,
                         pad_token_id=self.hf_tokenizer.eos_token_id,
                         eos_token_id=self.hf_tokenizer.eos_token_id,
                     )
 
+                # Validate generation outputs
+                if outputs.size(0) == 0:
+                    logger.error(f"Model generation produced no outputs for batch {batch_idx}")
+                    raise LLMJudgeException(f"Model generation produced no outputs for batch {batch_idx}")
+
                 # Decode responses
                 for j, output in enumerate(outputs):
-                    # Get the input length for this specific sequence
-                    input_length = model_inputs["input_ids"][j].shape[0]
+                    # Bounds check
+                    if j >= model_inputs["input_ids"].size(0):
+                        logger.error(f"Output index {j} out of bounds for input_ids size {model_inputs['input_ids'].size(0)}")
+                        continue
 
-                    # Extract only the newly generated tokens
-                    generated_ids = output[input_length:]
+                    input_length = model_inputs["input_ids"][j].size(0)
+
+                    # Validate output length
+                    if output.size(0) == 0:
+                        logger.warning(f"Empty output at index {j}, skipping")
+                        results.append("")
+                        continue
+
+                    if input_length > output.size(0):
+                        logger.warning(f"Input length {input_length} exceeds output length {output.size(0)} at index {j}, using full output")
+                        generated_ids = output
+                    else:
+                        # Extract only the newly generated tokens
+                        generated_ids = output[input_length:]
+
                     assistant_response = self.hf_tokenizer.decode(
                         generated_ids, skip_special_tokens=True
                     ).strip()
 
                     results.append(assistant_response)
-                    # print("assistant_response:", assistant_response)
+
+                    # Log sample generated texts for verification
+                    global_idx = i + j
+                    if global_idx < 3:
+                        preview = assistant_response[:500] + "..." if len(assistant_response) > 500 else assistant_response
+                        logger.info(f"[Sample Generation {global_idx + 1}] Response preview:\n{preview}")
 
             logger.info(f"Completed generating all {len(user_input)} conversations")
             return results
@@ -470,16 +555,31 @@ class LLMJudgeValidationModule(BaseValidationModule):
                     template = self._construct_conversation_template(
                         conversation, base_model=base_model,
                     )
+
+                    # Validate template is not empty
+                    if not template or not template.strip():
+                        logger.error(f"Empty template generated for conversation: {conversation}")
+                        raise LLMJudgeException("Empty conversation template generated")
+
                     batch_conversation_templates.append(template)
 
-                # Tokenization with padding for batch processing
+                # Only pad when batch_size > 1 to avoid unnecessary overhead
                 model_inputs = self.hf_tokenizer(
                     batch_conversation_templates,
                     return_tensors="pt",
                     add_special_tokens=True,
-                    padding=True,
+                    padding=(batch_size > 1),
                     truncation=True,
                 )
+
+                # Validate tokenization results
+                if "input_ids" not in model_inputs or model_inputs["input_ids"].size(0) == 0:
+                    logger.error(f"Tokenization failed for batch {batch_idx}. Templates: {batch_conversation_templates}")
+                    raise LLMJudgeException(f"Tokenization produced empty input_ids for batch {batch_idx}")
+
+                if model_inputs["input_ids"].size(1) == 0:
+                    logger.error(f"Tokenization produced empty sequences for batch {batch_idx}. Templates: {batch_conversation_templates}")
+                    raise LLMJudgeException(f"Tokenization produced empty sequences for batch {batch_idx}")
 
                 # Move to device if available
                 if (
@@ -495,19 +595,50 @@ class LLMJudgeValidationModule(BaseValidationModule):
                         max_new_tokens=max_length,
                         temperature=self.config.gen_temperature,
                         do_sample=True,
+                        top_p=0.95,
+                        top_k=50,
                         pad_token_id=self.hf_tokenizer.eos_token_id,
                         eos_token_id=self.hf_tokenizer.eos_token_id,
                     )
 
+                # Validate generation outputs
+                if outputs.size(0) == 0:
+                    logger.error(f"Model generation produced no outputs for batch {batch_idx}")
+                    raise LLMJudgeException(f"Model generation produced no outputs for batch {batch_idx}")
+
                 # Decode responses
                 batch_results = []
                 for j, output in enumerate(outputs):
-                    input_length = model_inputs["input_ids"][j].shape[0]
-                    generated_ids = output[input_length:]
+                    # Bounds check
+                    if j >= model_inputs["input_ids"].size(0):
+                        logger.error(f"Output index {j} out of bounds for input_ids size {model_inputs['input_ids'].size(0)}")
+                        continue
+
+                    input_length = model_inputs["input_ids"][j].size(0)
+
+                    # Validate output length
+                    if output.size(0) == 0:
+                        logger.warning(f"Empty output at index {j}, skipping")
+                        batch_results.append("")
+                        continue
+
+                    if input_length > output.size(0):
+                        logger.warning(f"Input length {input_length} exceeds output length {output.size(0)} at index {j}, using full output")
+                        generated_ids = output
+                    else:
+                        # Extract only the newly generated tokens
+                        generated_ids = output[input_length:]
+
                     assistant_response = self.hf_tokenizer.decode(
                         generated_ids, skip_special_tokens=True
                     ).strip()
                     batch_results.append(assistant_response)
+
+                    # Log sample generated texts for verification
+                    global_idx = i + j
+                    if global_idx < 3:
+                        preview = assistant_response[:500] + "..." if len(assistant_response) > 500 else assistant_response
+                        logger.info(f"[Sample Generation {global_idx + 1}] Response preview:\n{preview}")
 
                 yield (i, batch_results)
 
@@ -813,6 +944,14 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
         if not generated_conversations:
             raise LLMJudgeException("No valid conversations were generated")
+
+        # Log generation summary
+        non_empty_count = sum(1 for conv in generated_conversations
+                             if conv["conversations"][-1]["content"].strip())
+        avg_length = sum(len(conv["conversations"][-1]["content"])
+                        for conv in generated_conversations) / len(generated_conversations)
+        logger.info(f"Generation summary: {len(generated_conversations)} total, "
+                   f"{non_empty_count} non-empty, avg response length: {avg_length:.0f} chars")
 
         return generated_conversations
 
