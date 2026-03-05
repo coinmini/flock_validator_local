@@ -88,22 +88,32 @@ class LLMJudgeValidationModule(BaseValidationModule):
             logger.warning("Default OPENAI_BASE_URL/OPENAI_API_KEY not set, skipping default client")
             return
         try:
-            http_client = httpx.Client(
-                headers={"Authorization": f"Bearer {api_key}"},
+            timeout = httpx.Timeout(
+                connect=10.0,  # 10s to establish connection
+                read=120.0,  # 120s max to receive response
+                write=20.0,  # 20s to send request
+                pool=10.0,  # 10s to acquire connection from pool
             )
+
             self.client = OpenAI(
                 api_key=api_key,
                 base_url=base_url,
-                http_client=http_client,
+                timeout=timeout,
             )
+
         except Exception as e:
-            raise LLMJudgeException(f"Failed to initialize default OpenAI client: {e}") from e
+            raise LLMJudgeException(
+                f"Failed to initialize default OpenAI client: {e}"
+            ) from e
 
     def _create_openai_client(self, base_url: str, api_key: str) -> OpenAI:
-        http_client = httpx.Client(
-            headers={"Authorization": f"Bearer {api_key}"},
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=120.0,
+            write=20.0,
+            pool=10.0,
         )
-        return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+        return OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
 
     def _initialize_model_clients(self):
         """
@@ -162,6 +172,36 @@ class LLMJudgeValidationModule(BaseValidationModule):
             f"or set the default OPENAI_BASE_URL / OPENAI_API_KEY."
         )
 
+    def _adapt_messages_for_model(self, model_name: str, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """Adapt messages for models that don't support the 'system' role."""
+        if model_name not in self._NO_SYSTEM_ROLE_MODELS:
+            return messages
+
+        system_parts = []
+        other_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_parts.append(msg["content"])
+            else:
+                other_messages.append(msg)
+
+        if not system_parts:
+            return messages
+
+        system_text = "\n".join(system_parts)
+        adapted = []
+        prepended = False
+        for msg in other_messages:
+            if msg["role"] == "user" and not prepended:
+                adapted.append({"role": "user", "content": f"[System instruction]: {system_text}\n\n{msg['content']}"})
+                prepended = True
+            else:
+                adapted.append(msg)
+
+        if not prepended:
+            adapted.insert(0, {"role": "user", "content": system_text})
+        return adapted
+
     def _fetch_available_models(self):
         self.available_models = list(self.model_clients.keys())
 
@@ -173,10 +213,12 @@ class LLMJudgeValidationModule(BaseValidationModule):
                     if m not in self.available_models:
                         self.available_models.append(m)
             except Exception as e:
-                logger.error(f"Warning: Failed to fetch models from default API ({e})")
+                logger.error(
+                    f"Warning: Failed to fetch models from API ({e}), using fallback models"
+                )
 
         if not self.available_models:
-            logger.warning("No evaluation models available")
+            logger.warning("No evaluation models available, using fallback")
             self.available_models = ["gpt-4o"]
 
     def _download_lora_config(self, repo_id: str, revision: str) -> bool:
@@ -186,7 +228,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 filename="adapter_config.json",
                 local_dir="judge",
                 revision=revision,
-                force_download=True,
+                force_download=True,  # Disable fallback to cached files
             )
         except Exception as e:
             if "adapter_config.json" in str(e):
@@ -195,12 +237,14 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 )
                 return False
             else:
-                raise
+                raise  # Re-raise the exception if it's not related to the missing file
         return True
 
     def _load_model(self, repo_id: str, revision: str = "main", max_params: int = None):
+
         is_lora = self._download_lora_config(repo_id, revision=revision)
 
+        # Determine best dtype: prefer BF16 for numerical stability, fallback to FP16
         if torch.cuda.is_available():
             if torch.cuda.is_bf16_supported():
                 compute_dtype = torch.bfloat16
@@ -223,7 +267,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 repo_id=repo_id,
                 local_dir="judge",
                 revision=revision,
-                force_download=True,
+                force_download=True,  # Disable fallback to cached files
             )
             with open("judge/adapter_config.json", "r") as f:
                 adapter_config = json.load(f)
@@ -343,53 +387,83 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 base_model = "default"
 
             template = template_dict[base_model]
+
             conversation_parts = []
 
+            # Validate conversation structure
             if not isinstance(conversation, dict):
-                raise LLMJudgeException(f"Conversation must be a dict, got {type(conversation)}")
-            if "conversations" not in conversation:
-                raise LLMJudgeException("Conversation dict must have 'conversations' key")
-            if not conversation["conversations"]:
-                raise LLMJudgeException("Conversation 'conversations' list is empty")
+                raise LLMJudgeException(
+                    f"Conversation must be a dict, got {type(conversation)}"
+                )
 
+            if "conversations" not in conversation:
+                raise LLMJudgeException(
+                    f"Conversation dict must have 'conversations' key"
+                )
+
+            if not conversation["conversations"]:
+                raise LLMJudgeException(f"Conversation 'conversations' list is empty")
+
+            # Use provided system_text or fall back to template default
             if template.system_format:
-                system_prompt = conversation["system"] if "system" in conversation else None
-                system_content = system_prompt if system_prompt else "You are a helpful assistant."
+                system_prompt = (
+                    conversation["system"] if "system" in conversation else None
+                )
+                system_content = (
+                    system_prompt if system_prompt else "You are a helpful assistant."
+                )
                 if system_content:
-                    formatted_system = template.system_format.format(content=system_content)
+                    formatted_system = template.system_format.format(
+                        content=system_content
+                    )
                     conversation_parts.append(formatted_system)
 
+            # Multi-turn conversation: format each message according to template
             for msg in conversation["conversations"]:
-                if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+                if (
+                    not isinstance(msg, dict)
+                    or "role" not in msg
+                    or "content" not in msg
+                ):
                     logger.warning(f"Skipping invalid message: {msg}")
                     continue
 
                 if msg["role"] == "user":
                     user_text = template.user_format.format(
-                        content=msg["content"], stop_token=self.hf_tokenizer.eos_token,
+                        content=msg["content"],
+                        stop_token=self.hf_tokenizer.eos_token,
                     )
                     conversation_parts.append(user_text)
                 elif msg["role"] == "assistant":
                     assistant_text = template.assistant_format.format(
-                        content=msg["content"], stop_token=self.hf_tokenizer.eos_token,
+                        content=msg["content"],
+                        stop_token=self.hf_tokenizer.eos_token,
                     )
                     conversation_parts.append(assistant_text)
 
             conversation_format = "".join(conversation_parts)
 
             if not conversation_format.strip():
-                logger.error(f"Empty template generated. Template: {base_model}, Conversation: {conversation}")
-                raise LLMJudgeException("Generated conversation template is empty after formatting")
+                logger.error(
+                    f"Empty template generated. Template: {base_model}, Conversation: {conversation}, Parts: {conversation_parts}"
+                )
+                raise LLMJudgeException(
+                    f"Generated conversation template is empty after formatting"
+                )
 
         except Exception as e:
-            raise LLMJudgeException(f"Failed to construct conversation template: {e}") from e
+            raise LLMJudgeException(
+                f"Failed to construct conversation template: {e}"
+            ) from e
 
         return conversation_format
 
     def _generate_response(
         self,
         context_length: int,
-        user_input: list = list[list[dict[str, str]]],
+        user_input: list = list[
+            list[dict[str, str]]
+        ],  # list of conversations, each conversation is a list of messages
         base_model: str = "default",
         max_length: int = 2048,
         batch_size: int = 1,
@@ -404,68 +478,128 @@ class LLMJudgeValidationModule(BaseValidationModule):
             for batch_idx, i in enumerate(range(0, len(user_input), batch_size), 1):
                 batch_conversations = user_input[i : i + batch_size]
 
+                # Apply chat template with fallback
                 batch_conversation_templates = []
                 for conversation in batch_conversations:
-                    template = self._construct_conversation_template(conversation, base_model=base_model)
+                    template = self._construct_conversation_template(
+                        conversation,
+                        base_model=base_model,
+                    )
+
+                    # Validate template is not empty
                     if not template or not template.strip():
-                        logger.error(f"Empty template generated for conversation: {conversation}")
-                        raise LLMJudgeException("Empty conversation template generated")
+                        logger.error(
+                            f"Empty template generated for conversation: {conversation}"
+                        )
+                        raise LLMJudgeException(
+                            f"Empty conversation template generated"
+                        )
+
                     batch_conversation_templates.append(template)
 
+                # Simple tokenization
+                # Only pad when batch_size > 1 to avoid unnecessary overhead
                 model_inputs = self.hf_tokenizer(
                     batch_conversation_templates,
                     return_tensors="pt",
                     add_special_tokens=True,
                     padding=(batch_size > 1),
-                    truncation=True,
                 )
 
-                if "input_ids" not in model_inputs or model_inputs["input_ids"].size(0) == 0:
-                    raise LLMJudgeException(f"Tokenization produced empty input_ids for batch {batch_idx}")
-                if model_inputs["input_ids"].size(1) == 0:
-                    raise LLMJudgeException(f"Tokenization produced empty sequences for batch {batch_idx}")
+                # Validate tokenization results
+                if (
+                    "input_ids" not in model_inputs
+                    or model_inputs["input_ids"].size(0) == 0
+                ):
+                    logger.error(
+                        f"Tokenization failed for batch {batch_idx}. Templates: {batch_conversation_templates}"
+                    )
+                    raise LLMJudgeException(
+                        f"Tokenization produced empty input_ids for batch {batch_idx}"
+                    )
 
-                if torch.cuda.is_available() and next(self.hf_model.parameters()).is_cuda:
+                if model_inputs["input_ids"].size(1) == 0:
+                    logger.error(
+                        f"Tokenization produced empty sequences for batch {batch_idx}. Templates: {batch_conversation_templates}"
+                    )
+                    raise LLMJudgeException(
+                        f"Tokenization produced empty sequences for batch {batch_idx}"
+                    )
+
+                # Move to device if available
+                if (
+                    torch.cuda.is_available()
+                    and next(self.hf_model.parameters()).is_cuda
+                ):
                     model_inputs = {k: v.cuda() for k, v in model_inputs.items()}
 
-                logger.info(f"Generating batch {batch_idx}/{total_batches} ({min(i + batch_size, len(user_input))}/{len(user_input)} conversations)...")
+                logger.info(
+                    f"Generating batch {batch_idx}/{total_batches} ({min(i + batch_size, len(user_input))}/{len(user_input)} conversations)..."
+                )
                 with torch.no_grad():
                     outputs = self.hf_model.generate(
                         **model_inputs,
                         max_new_tokens=max_length,
                         temperature=self.config.gen_temperature,
                         do_sample=True,
-                        top_p=0.95,
-                        top_k=50,
+                        top_p=0.95,  # Nucleus sampling for stability
+                        top_k=50,  # Limit vocabulary for stability
                         pad_token_id=self.hf_tokenizer.eos_token_id,
                         eos_token_id=self.hf_tokenizer.eos_token_id,
                     )
 
+                # Validate generation outputs
                 if outputs.size(0) == 0:
-                    raise LLMJudgeException(f"Model generation produced no outputs for batch {batch_idx}")
+                    logger.error(
+                        f"Model generation produced no outputs for batch {batch_idx}"
+                    )
+                    raise LLMJudgeException(
+                        f"Model generation produced no outputs for batch {batch_idx}"
+                    )
 
+                # Decode responses
                 for j, output in enumerate(outputs):
+                    # Get the input length for this specific sequence
                     if j >= model_inputs["input_ids"].size(0):
-                        logger.error(f"Output index {j} out of bounds for input_ids size {model_inputs['input_ids'].size(0)}")
+                        logger.error(
+                            f"Output index {j} out of bounds for input_ids size {model_inputs['input_ids'].size(0)}"
+                        )
                         continue
+
                     input_length = model_inputs["input_ids"][j].size(0)
+
+                    # Validate output length
                     if output.size(0) == 0:
                         logger.warning(f"Empty output at index {j}, skipping")
                         results.append("")
                         continue
+
                     if input_length > output.size(0):
-                        logger.warning(f"Input length {input_length} exceeds output length {output.size(0)} at index {j}, using full output")
+                        logger.warning(
+                            f"Input length {input_length} exceeds output length {output.size(0)} at index {j}, using full output"
+                        )
                         generated_ids = output
                     else:
+                        # Extract only the newly generated tokens
                         generated_ids = output[input_length:]
 
-                    assistant_response = self.hf_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                    assistant_response = self.hf_tokenizer.decode(
+                        generated_ids, skip_special_tokens=True
+                    ).strip()
+
                     results.append(assistant_response)
 
+                    # Log sample generated texts for verification
                     global_idx = i + j
-                    if global_idx < 3:
-                        preview = assistant_response[:500] + "..." if len(assistant_response) > 500 else assistant_response
-                        logger.info(f"[Sample Generation {global_idx + 1}] Response preview:\n{preview}")
+                    if global_idx < 3:  # Log first 3 generated responses
+                        preview = (
+                            assistant_response[:500] + "..."
+                            if len(assistant_response) > 500
+                            else assistant_response
+                        )
+                        logger.info(
+                            f"[Sample Generation {global_idx + 1}] Response preview:\n{preview}"
+                        )
 
             logger.info(f"Completed generating all {len(user_input)} conversations")
             return results
@@ -559,22 +693,76 @@ class LLMJudgeValidationModule(BaseValidationModule):
             raise LLMJudgeException(f"Failed to generate response: {e}") from e
 
     def _select_eval_model(self, eval_args: dict) -> str:
-        eval_model_list = eval_args.get("eval_model_list", [])
-        if eval_model_list:
-            available_eval_models = [m for m in eval_model_list if m in self.available_models]
-            if len(available_eval_models) == len(eval_model_list):
-                selected_model = random.choice(eval_model_list)
-                logger.info(f"Using eval_model_list: selected {selected_model}")
-                return selected_model
-        return random.choice(self.available_models)
+        """
+        Select evaluation model based on eval_args configuration
+        """
+        eval_model_list = self._resolve_eval_models(eval_args)
 
-    def _normalize_score(self, score: float, min_score: float = 0, max_score: float = 10.0) -> float:
-        return (score - min_score) / (max_score - min_score)
+        if eval_model_list:
+            selected_model = random.choice(eval_model_list)
+            logger.info(f"Using eval_model_list: selected {selected_model}")
+            return selected_model
+
+        # random selection from available models
+        selected_model = random.choice(self.available_models)
+        return selected_model
+
+    def _resolve_eval_models(self, eval_args: dict) -> List[str]:
+        """
+        Resolve requested eval models against provider model list.
+        Supports alias forms like "<model>-low/high" by matching their parsed base model.
+        Returns requested model names (so extra params can still be derived later).
+        """
+        requested_models = eval_args.get("eval_model_list", []) if eval_args else []
+        if not requested_models:
+            return self.available_models
+
+        resolved_models = []
+        missing_models = []
+        for requested_model in requested_models:
+            if requested_model in self.available_models:
+                resolved_models.append(requested_model)
+                continue
+
+            parsed_model_name, _ = self._parse_model_name_to_params(requested_model)
+            if parsed_model_name in self.available_models:
+                logger.info(
+                    f"Resolved eval model '{requested_model}' to available model '{parsed_model_name}'."
+                )
+                resolved_models.append(requested_model)
+            else:
+                missing_models.append(requested_model)
+
+        # De-duplicate while preserving order
+        resolved_models = list(dict.fromkeys(resolved_models))
+
+        if missing_models:
+            logger.warning(
+                f"Requested eval models not available and will be skipped: {missing_models}"
+            )
+
+        if not resolved_models:
+            logger.warning(
+                "No requested eval models matched provider list, falling back to all available models."
+            )
+            return self.available_models
+
+        return resolved_models
+
+    def _normalize_score(
+        self, score: float, min_score: float = 0, max_score: float = 10.0
+    ) -> float:
+        """
+        Normalize score to (0, 1) range
+        """
+        normalized = (score - min_score) / (max_score - min_score)
+        return normalized
 
     def _parse_model_name_to_params(self, model_name: str) -> tuple[str, dict[str, Any]]:
         params: dict[str, Any] = {}
         extra: dict[str, Any] = {}
         model_parts: list[str] = []
+
         REASONING_EFFORTS = {"low", "high"}
 
         for part in model_name.split('-'):
@@ -591,45 +779,25 @@ class LLMJudgeValidationModule(BaseValidationModule):
         params["extra_body"] = extra
         return cleaned_model_name, params
 
-    def _adapt_messages_for_model(self, model_name: str, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """Adapt messages for models that don't support the 'system' role."""
-        if model_name not in self._NO_SYSTEM_ROLE_MODELS:
-            return messages
+    def _call_gpt(
+        self, messages: List[Dict[str, str]], eval_args: dict
+    ) -> tuple[str, str]:
+        """
+        Call GPT API with model and temperature from eval_args, with exponential backoff retry.
 
-        system_parts = []
-        other_messages = []
-        for msg in messages:
-            if msg["role"] == "system":
-                system_parts.append(msg["content"])
-            else:
-                other_messages.append(msg)
-
-        if not system_parts:
-            return messages
-
-        system_text = "\n".join(system_parts)
-        adapted = []
-        prepended = False
-        for msg in other_messages:
-            if msg["role"] == "user" and not prepended:
-                adapted.append({"role": "user", "content": f"[System instruction]: {system_text}\n\n{msg['content']}"})
-                prepended = True
-            else:
-                adapted.append(msg)
-
-        if not prepended:
-            adapted.insert(0, {"role": "user", "content": system_text})
-        return adapted
-
-    def _call_gpt(self, messages: List[Dict[str, str]], eval_args: dict) -> tuple[str, str]:
+        Returns:
+            Tuple of (API response content, selected model name)
+        """
+        # Check if a specific model is requested
         if "selected_model" in eval_args:
             eval_model = eval_args["selected_model"]
         else:
             eval_model = self._select_eval_model(eval_args)
-        temperature = eval_args.get("temperature", 0.1)
+        temperature = eval_args.get("temperature", 0.1)  # Default eval temperature
 
         selected_model, model_params = self._parse_model_name_to_params(eval_model)
 
+        # Patch: kimi-k2.5-thinking requires temperature=1 and instant requires temperature=0.6
         if eval_model == "kimi-k2.5":
             temperature = 0.6
         elif eval_model == "kimi-k2.5-thinking":
@@ -658,7 +826,12 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 f"retrying in {retry_state.next_action.sleep:.1f}s: {retry_state.outcome.exception()}"
             )
 
-        @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4), before_sleep=log_retry, reraise=True)
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=1, max=4),
+            before_sleep=log_retry,
+            reraise=True,
+        )
         def _make_api_call():
             client = self._get_client_for_model(eval_model)
             completion = client.chat.completions.create(**params)
@@ -668,7 +841,9 @@ class LLMJudgeValidationModule(BaseValidationModule):
             content = _make_api_call()
             return content, eval_model
         except Exception as e:
-            raise LLMJudgeException(f"API call failed with model {eval_model} after retries: {e}")
+            raise LLMJudgeException(
+                f"API call failed with model {eval_model} after retries: {e}"
+            )
 
     def _parse_jsonl_conversations(self, test_file: str) -> List[Dict[str, Any]]:
         """Parse JSONL file into conversation structures without generating responses."""
@@ -746,45 +921,85 @@ class LLMJudgeValidationModule(BaseValidationModule):
             "tools": input_item.get("tools"),
         }
 
-    def _load_jsonl_conversations(self, base_model: str, test_file: str, eval_args: dict, context_length: int) -> List[Dict[str, Any]]:
-        """Parse JSONL and generate all responses. Used by validate() for online mode."""
-        max_gen_try = eval_args.get("gen_require", 1)
+    def _load_jsonl_conversations(
+        self, base_model: str, test_file: str, eval_args: dict, context_length: int
+    ) -> List[Dict[str, Any]]:
+
+        # Extract parameters from eval_args
+        max_gen_try = eval_args.get("gen_require", 1)  # Default max generation tries
+
+        # Parse all input conversations first
         input_conversations = self._parse_jsonl_conversations(test_file)
+
         generated_conversations = []
 
+        # Generate responses for each input conversation
         for gen_try in range(max_gen_try):
-            logger.info(f"Generation attempt {gen_try + 1}/{max_gen_try} for {len(input_conversations)} conversations...")
-            batch_conversations = [item["conversation"] for item in input_conversations]
-            assistant_responses = self._generate_response(
-                user_input=batch_conversations, base_model=base_model,
-                batch_size=self.config.gen_batch_size, eval_args=eval_args, context_length=context_length,
+            logger.info(
+                f"Generation attempt {gen_try + 1}/{max_gen_try} for {len(input_conversations)} conversations..."
             )
-            for input_item, assistant_response in zip(input_conversations, assistant_responses):
-                generated_conversations.append(self._build_conversation_result(input_item, assistant_response, gen_try, max_gen_try))
+            # Prepare batch of conversations for generation
+            batch_conversations = [item["conversation"] for item in input_conversations]
+
+            # Generate responses using batch processing
+            assistant_responses = self._generate_response(
+                user_input=batch_conversations,
+                base_model=base_model,
+                batch_size=self.config.gen_batch_size,
+                eval_args=eval_args,
+                context_length=context_length,
+            )
+
+            # Create conversation structures for this generation
+            for input_item, assistant_response in zip(
+                input_conversations, assistant_responses
+            ):
+                generated_conversations.append(
+                    self._build_conversation_result(input_item, assistant_response, gen_try, max_gen_try)
+                )
 
         if not generated_conversations:
             raise LLMJudgeException("No valid conversations were generated")
 
-        non_empty_count = sum(1 for conv in generated_conversations if conv["conversations"][-1]["content"].strip())
-        avg_length = sum(len(conv["conversations"][-1]["content"]) for conv in generated_conversations) / len(generated_conversations)
-        logger.info(f"Generation summary: {len(generated_conversations)} total, {non_empty_count} non-empty, avg response length: {avg_length:.0f} chars")
+        # Log generation summary
+        non_empty_count = sum(
+            1
+            for conv in generated_conversations
+            if conv["conversations"][-1]["content"].strip()
+        )
+        avg_length = sum(
+            len(conv["conversations"][-1]["content"])
+            for conv in generated_conversations
+        ) / len(generated_conversations)
+        logger.info(
+            f"Generation summary: {len(generated_conversations)} total, "
+            f"{non_empty_count} non-empty, avg response length: {avg_length:.0f} chars"
+        )
+
         return generated_conversations
 
-    def _format_single_conversation(self, conversation_data: Dict[str, Any]) -> tuple[str, str]:
+    def _format_single_conversation(
+        self, conversation_data: Dict[str, Any]
+    ) -> tuple[str, str]:
         """Format a single conversation for evaluation, returns (context, assistant_response)"""
         conversations = conversation_data.get("conversations", [])
+
         if not conversations:
             return "No conversation found", ""
 
+        # Format the conversation, separating context from the last assistant response
         formatted_parts = []
         assistant_response = ""
 
         for i, msg in enumerate(conversations):
             role = msg.get("role", "")
             content = msg.get("content", "")
+
+            # Check if this is the last message and it's an assistant/function_call response
             if i == len(conversations) - 1 and role in ["assistant", "function_call"]:
                 assistant_response = content
                 break
+
             if role == "system":
                 formatted_parts.append(f"System: {content}")
             elif role == "user":
@@ -799,19 +1014,49 @@ class LLMJudgeValidationModule(BaseValidationModule):
         return "\n\n".join(formatted_parts), assistant_response
 
     def _construct_evaluation_prompt(
-        self, conversation_context: str, prompt_id: int, reference: str = None, tools: str = None, assistant_response: str = None,
+        self,
+        conversation_context: str,
+        prompt_id: int,
+        reference: str = None,
+        tools: str = None,
+        assistant_response: str = None,
     ) -> List[Dict[str, str]]:
+        """Construct evaluation prompt for a single conversation"""
         try:
             if prompt_id == 1:
-                user_message = get_prompt(prompt_id, conversation_context, assistant_response=assistant_response)
+                # Default evaluation prompt with assistant response
+                user_message = get_prompt(
+                    prompt_id,
+                    conversation_context,
+                    assistant_response=assistant_response,
+                )
             elif reference and prompt_id == 2:
-                user_message = get_prompt(prompt_id, conversation_context, reference, assistant_response=assistant_response)
+                # Use reference evaluation prompt with assistant response
+                user_message = get_prompt(
+                    prompt_id,
+                    conversation_context,
+                    reference,
+                    assistant_response=assistant_response,
+                )
             elif reference and prompt_id == 3 and tools:
-                user_message = get_prompt(prompt_id, conversation_context, reference, tools, assistant_response)
+                # Use function_call reference evaluation prompt with tools and assistant response
+                user_message = get_prompt(
+                    prompt_id,
+                    conversation_context,
+                    reference,
+                    tools,
+                    assistant_response,
+                )
             else:
-                user_message = get_prompt(prompt_id, conversation_context, assistant_response=assistant_response)
+                user_message = get_prompt(
+                    prompt_id,
+                    conversation_context,
+                    assistant_response=assistant_response,
+                )
         except ValueError as e:
-            user_message = get_prompt(1, conversation_context, assistant_response=assistant_response)
+            user_message = get_prompt(
+                1, conversation_context, assistant_response=assistant_response
+            )
             logger.warning(f"Warning: {e}. Using default prompt.")
 
         system_prompt = """You are a fair judge, please output the score, confidence, and reasoning for the given conversation."""
@@ -820,54 +1065,94 @@ class LLMJudgeValidationModule(BaseValidationModule):
             {"role": "system", "content": system_prompt},
         ]
 
-    def _parse_llm_response(self, response: str, model_name: str = None) -> Dict[str, Any]:
+    def _parse_llm_response(
+        self, response: str, model_name: str = None
+    ) -> Dict[str, Any]:
         result = {"score": 5.0, "confidence": 0, "reasoning": None}
+
         try:
             json_match = re.search(r'\{[^}]*"score"[^}]*\}', response, re.DOTALL)
             if json_match:
-                parsed_json = json.loads(json_match.group(0))
+                json_str = json_match.group(0)
+                parsed_json = json.loads(json_str)
+
                 if "score" in parsed_json:
                     result["score"] = float(parsed_json["score"])
                 if "confidence" in parsed_json:
                     result["confidence"] = float(parsed_json["confidence"])
                 if "reasoning" in parsed_json:
                     result["reasoning"] = str(parsed_json["reasoning"])
+
                 return result
             else:
-                logger.error(f"Model '{model_name}' did not return valid JSON format. Response: {response[:200]}...")
+                # No JSON found in response
+                logger.error(
+                    f"Model '{model_name}' did not return valid JSON format. "
+                    f"Response: {response[:200]}..."
+                )
                 return result
         except (json.JSONDecodeError, ValueError, KeyError) as e:
-            logger.error(f"Model '{model_name}' returned malformed JSON: {e}. Response: {response[:200]}...")
+            logger.error(
+                f"Model '{model_name}' returned malformed JSON: {e}. "
+                f"Response: {response[:200]}..."
+            )
             return result
 
-    def _evaluate_single_conversation(self, conversation_data: Dict[str, Any], eval_args: dict, max_eval_try: int, conv_idx: int) -> Dict[str, Any]:
-        conversation_context, assistant_response = self._format_single_conversation(conversation_data)
+    def _evaluate_single_conversation(
+        self,
+        conversation_data: Dict[str, Any],
+        eval_args: dict,
+        max_eval_try: int,
+        conv_idx: int,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate a single conversation and return scores, confidences, and reasoning
+        """
+        conversation_context, assistant_response = self._format_single_conversation(
+            conversation_data
+        )
         reference = conversation_data.get("reference")
         tools = conversation_data.get("tools")
-        messages = self._construct_evaluation_prompt(conversation_context, eval_args.get("prompt_id", 0), reference, tools, assistant_response)
+        messages = self._construct_evaluation_prompt(
+            conversation_context,
+            eval_args.get("prompt_id", 0),
+            reference,
+            tools,
+            assistant_response,
+        )
 
         conv_scores = []
         conv_confidences = []
         conv_reasoning = []
 
-        eval_model_list = eval_args.get("eval_model_list", [])
-        available_eval_models = [m for m in eval_model_list if m in self.available_models]
-        if not available_eval_models:
-            available_eval_models = self.available_models
+        # Get available models for evaluation
+        available_eval_models = self._resolve_eval_models(eval_args)
 
+        # Evaluate with each model for max_eval_try times
         for model_idx, model_name in enumerate(available_eval_models):
             for try_num in range(max_eval_try):
+                # Create modified eval_args to specify the exact model to use
                 model_eval_args = eval_args.copy()
                 model_eval_args["selected_model"] = model_name
+
                 response, selected_model = self._call_gpt(messages, model_eval_args)
-                parsed_result = self._parse_llm_response(response, model_name=selected_model)
+                parsed_result = self._parse_llm_response(
+                    response, model_name=selected_model
+                )
+
                 conv_scores.append(parsed_result["score"])
                 if parsed_result["confidence"] is not None:
                     conv_confidences.append(parsed_result["confidence"])
                 if parsed_result["reasoning"]:
-                    conv_reasoning.append(f"Conv{conv_idx}-Model{model_idx + 1}({selected_model})-Try{try_num + 1}: {parsed_result['reasoning']}")
+                    conv_reasoning.append(
+                        f"Conv{conv_idx}-Model{model_idx + 1}({selected_model})-Try{try_num + 1}: {parsed_result['reasoning']}"
+                    )
 
-        return {"scores": conv_scores, "confidences": conv_confidences, "reasoning": conv_reasoning}
+        return {
+            "scores": conv_scores,
+            "confidences": conv_confidences,
+            "reasoning": conv_reasoning,
+        }
 
     def validate(self, data: LLMJudgeInputData, **kwargs) -> LLMJudgeMetrics:
         eval_file = download_file(data.validation_set_url)
@@ -875,58 +1160,117 @@ class LLMJudgeValidationModule(BaseValidationModule):
         try:
             self._load_model(data.hg_repo_id, data.revision, data.max_params)
         except InvalidModelParametersException as e:
+            # lowest possible reward for invalid model parameters
             logger.info(f"Invalid model parameters: {e}")
             return LLMJudgeMetrics(score=LOWEST_POSSIBLE_SCORE)
 
+        # Stage 1: Generate all responses
         logger.info("Stage 1: Generating all conversations for evaluation...")
-        all_conversations = self._load_jsonl_conversations(data.base_model, eval_file, data.eval_args, data.context_length)
+        all_conversations = self._load_jsonl_conversations(
+            data.base_model, eval_file, data.eval_args, data.context_length
+        )
 
-        max_eval_try = data.eval_args.get("eval_require", 3)
+        # Load evaluation arguments
+
+        max_eval_try = data.eval_args.get(
+            "eval_require", 3
+        )  # Default max evaluation tries
         eval_batch_size = self.config.eval_batch_size
-        eval_model_list = data.eval_args.get("eval_model_list", [])
-        available_eval_models = [m for m in eval_model_list if m in self.available_models]
-        if not available_eval_models:
-            available_eval_models = self.available_models
 
-        total_eval_calls = len(all_conversations) * len(available_eval_models) * max_eval_try
-        logger.info(f"Stage 2: Evaluating {len(all_conversations)} conversations with {len(available_eval_models)} models, {max_eval_try} tries each = {total_eval_calls} total evaluations using {eval_batch_size} workers...")
+        # Calculate total evaluation calls
+        available_eval_models = self._resolve_eval_models(data.eval_args)
 
-        evaluation_tasks = [(conv, data.eval_args, max_eval_try, idx) for idx, conv in enumerate(all_conversations)]
+        total_eval_calls = (
+            len(all_conversations) * len(available_eval_models) * max_eval_try
+        )
+
+        # Stage 2: Direct parallel evaluation of all conversations
+        logger.info(
+            f"Stage 2: Evaluating {len(all_conversations)} conversations with {len(available_eval_models)} models, "
+            f"{max_eval_try} tries each = {total_eval_calls} total evaluations using {eval_batch_size} workers..."
+        )
+
+        # Prepare evaluation tasks for all conversations directly
+        evaluation_tasks = []
+        for idx, conversation_data in enumerate(all_conversations):
+            evaluation_tasks.append(
+                (
+                    conversation_data,
+                    data.eval_args,
+                    max_eval_try,
+                    idx,  # conversation index
+                )
+            )
 
         with ThreadPoolExecutor(max_workers=eval_batch_size) as executor:
-            future_to_task = {executor.submit(self._evaluate_single_conversation, *task): task for task in evaluation_tasks}
+            # Submit all tasks
+            future_to_task = {
+                executor.submit(self._evaluate_single_conversation, *task): task
+                for task in evaluation_tasks
+            }
+
+            # Collect results with progress tracking
             evaluation_results = []
             completed_count = 0
+            total_tasks = len(evaluation_tasks)
 
             for future in as_completed(future_to_task):
                 try:
                     result = future.result()
                     evaluation_results.append(result)
                     completed_count += 1
-                    evaluations_done = completed_count * len(available_eval_models) * max_eval_try
+
+                    # Calculate progress
+                    evaluations_done = (
+                        completed_count * len(available_eval_models) * max_eval_try
+                    )
                     progress_pct = (evaluations_done / total_eval_calls) * 100
-                    logger.info(f"Evaluation progress: {completed_count}/{len(evaluation_tasks)} conversations evaluated ({evaluations_done}/{total_eval_calls} LLM calls, {progress_pct:.1f}%)")
+                    logger.info(
+                        f"Evaluation progress: {completed_count}/{total_tasks} conversations evaluated ({evaluations_done}/{total_eval_calls} LLM calls, {progress_pct:.1f}%)"
+                    )
                 except Exception as e:
                     logger.error(f"Evaluation task failed: {e}")
                     completed_count += 1
-                    evaluation_results.append({"scores": [5.0], "confidences": [0.5], "reasoning": ["Evaluation failed"]})
+                    # Add default result for failed tasks
+                    evaluation_results.append(
+                        {
+                            "scores": [5.0],
+                            "confidences": [0.5],
+                            "reasoning": ["Evaluation failed"],
+                        }
+                    )
 
-        logger.info(f"Completed all {total_eval_calls} evaluation calls across {len(all_conversations)} conversations")
+        # Execute all evaluations in parallel
+        logger.info(
+            f"Completed all {total_eval_calls} evaluation calls across {len(all_conversations)} conversations"
+        )
 
         all_weighted_scores = []
         all_reasoning = []
+        # Process all results
         for result in evaluation_results:
             scores = result.get("scores", [])
             confidences = result.get("confidences", [])
+
             if scores and confidences:
                 for s, c in zip(scores, confidences):
                     all_weighted_scores.append(s * c)
             if result.get("reasoning"):
                 all_reasoning.extend(result["reasoning"])
 
-        raw_avg_score = sum(all_weighted_scores) / len(all_weighted_scores) if all_weighted_scores else 5.0
+        # Calculate overall averages across all conversations
+        raw_avg_score = (
+            sum(all_weighted_scores) / len(all_weighted_scores)
+            if all_weighted_scores
+            else 5.0
+        )
+        combined_reasoning = "\n\n".join(all_reasoning) if all_reasoning else None
+
+        # Normalize the final score to (0, 1) range
         score_finally = self._normalize_score(raw_avg_score)
-        logger.info(f"Overall normalized score_finally (0-1 range): {score_finally:.4f}")
+        logger.info(
+            f"Overall normalized score_finally (0-1 range): {score_finally:.4f}"
+        )
         return LLMJudgeMetrics(score=score_finally)
 
     def validate_local(
@@ -956,10 +1300,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
         eval_batch_size = self.config.eval_batch_size
 
         if not self.skip_llm_eval:
-            eval_model_list = eval_args.get("eval_model_list", [])
-            available_eval_models = [m for m in eval_model_list if m in self.available_models]
-            if not available_eval_models:
-                available_eval_models = self.available_models
+            available_eval_models = self._resolve_eval_models(eval_args)
             logger.info(f"Evaluation models: {available_eval_models}")
 
         all_conversations = []
@@ -1043,6 +1384,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 closed.add(client_id)
         self.model_clients.clear()
 
+        # Clean up HuggingFace model resources
         if self.hf_model is not None:
             try:
                 if torch.cuda.is_available():
