@@ -348,7 +348,6 @@ class LLMJudgeValidationModule(BaseValidationModule):
         model_kwargs = dict(
             trust_remote_code=True,
             torch_dtype=compute_dtype,
-            use_cache=False,
             device_map="auto",
         )
         if is_lora:
