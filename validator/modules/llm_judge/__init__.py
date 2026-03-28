@@ -424,22 +424,22 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 except Exception:
                     pass
 
-            template_kwargs = dict(
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            if tools_for_template:
-                template_kwargs["tools"] = tools_for_template
-
             # Disable thinking for Qwen3.5 models that support it
             try:
                 template = self.hf_tokenizer.apply_chat_template(
-                    messages, enable_thinking=False, **template_kwargs
+                    messages,
+                    tools=tools_for_template,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
                 )
             except TypeError:
                 # Fallback for tokenizers that don't support enable_thinking
                 template = self.hf_tokenizer.apply_chat_template(
-                    messages, **template_kwargs
+                    messages,
+                    tools=tools_for_template,
+                    tokenize=False,
+                    add_generation_prompt=True,
                 )
 
             if not template or not template.strip():
@@ -674,8 +674,8 @@ class LLMJudgeValidationModule(BaseValidationModule):
                         max_new_tokens=max_length,
                         temperature=self.config.gen_temperature,
                         do_sample=True,
-                        top_p=0.95,
-                        top_k=50,
+                        top_p=0.8,
+                        top_k=20,
                         pad_token_id=self.hf_tokenizer.eos_token_id,
                         eos_token_id=self.hf_tokenizer.eos_token_id,
                     )
@@ -953,10 +953,21 @@ class LLMJudgeValidationModule(BaseValidationModule):
                             elif role in ["user", "assistant"] and content:
                                 conversation_to_process.append({"role": role, "content": content})
 
+                        # Extract reference response (last assistant or function_call message)
+                        # Use original conversations data to check role (matches official)
+                        reference_response = None
                         if conversation_to_process:
-                            last_msg = conversation_to_process[-1]
-                            if last_msg["role"] in ["assistant", "tool"]:
-                                reference_response = last_msg.get("content", "")
+                            last_msg = conversations[-1]
+                            if last_msg["role"] in ["assistant"]:
+                                reference_response = last_msg["content"]
+                                conversation_to_process = conversation_to_process[:-1]
+                            elif last_msg["role"] in ["function_call"]:
+                                env = Environment(trim_blocks=True, lstrip_blocks=True)
+                                conversation_template = env.from_string(template_str)
+                                reference_response = conversation_template.render(
+                                    messages=[conversation_to_process[-1]],
+                                    trim_blocks=True, lstrip_blocks=True,
+                                )
                                 conversation_to_process = conversation_to_process[:-1]
 
                         if "tools" in json_data:
@@ -972,6 +983,8 @@ class LLMJudgeValidationModule(BaseValidationModule):
                     continue
 
                 input_conversations_data["conversations"] = conversation_to_process
+                if tools_info is not None:
+                    input_conversations_data["tools"] = tools_info
                 input_conversations.append({
                     "conversation": input_conversations_data,
                     "line_num": line_num,
