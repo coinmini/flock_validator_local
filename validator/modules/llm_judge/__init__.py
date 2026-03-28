@@ -66,6 +66,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
     # Models whose APIs do not accept the "system" role
     _NO_SYSTEM_ROLE_MODELS = {"minimax-m2.1"}
+    _NO_SEED_MODELS = {"gemini"}
 
     def __init__(self, config: LLMJudgeConfig, skip_llm_eval: bool = False, **kwargs):
         super().__init__(config, **kwargs)
@@ -851,8 +852,10 @@ class LLMJudgeValidationModule(BaseValidationModule):
             "model": api_model_name,
             "messages": adapted_messages,
             "temperature": temperature,
-            "seed": random.randint(0, 10000),
         }
+        # Some providers (e.g. Gemini) don't support the seed parameter
+        if not any(prefix in eval_model.lower() for prefix in self._NO_SEED_MODELS):
+            params["seed"] = random.randint(0, 10000)
         params.update(model_params)
 
         def log_retry(retry_state):
