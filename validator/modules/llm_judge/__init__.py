@@ -410,11 +410,20 @@ class LLMJudgeValidationModule(BaseValidationModule):
             if not conversation["conversations"]:
                 raise LLMJudgeException(f"Conversation 'conversations' list is empty")
 
+            # Map roles to ones recognized by chat templates:
+            # function_call -> assistant, observation -> tool
+            role_mapping = {
+                "function_call": "assistant",
+                "observation": "tool",
+            }
+
             messages = []
             if conversation.get("system"):
                 messages.append({"role": "system", "content": conversation["system"]})
 
-            messages += conversation["conversations"]
+            for msg in conversation["conversations"]:
+                mapped_role = role_mapping.get(msg["role"], msg["role"])
+                messages.append({"role": mapped_role, "content": msg["content"]})
 
             tools_for_template = conversation.get("tools", None)
             if tools_for_template is not None:
