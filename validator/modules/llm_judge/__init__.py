@@ -410,20 +410,11 @@ class LLMJudgeValidationModule(BaseValidationModule):
             if not conversation["conversations"]:
                 raise LLMJudgeException(f"Conversation 'conversations' list is empty")
 
-            # Map roles to ones recognized by chat templates:
-            # function_call -> assistant, observation -> tool
-            role_mapping = {
-                "function_call": "assistant",
-                "observation": "tool",
-            }
-
             messages = []
             if conversation.get("system"):
                 messages.append({"role": "system", "content": conversation["system"]})
 
-            for msg in conversation["conversations"]:
-                mapped_role = role_mapping.get(msg["role"], msg["role"])
-                messages.append({"role": mapped_role, "content": msg["content"]})
+            messages += conversation["conversations"]
 
             tools_for_template = conversation.get("tools", None)
             if tools_for_template is not None:
@@ -906,6 +897,8 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 conversation_to_process = []
                 reference_response = None
                 tools_info = None
+                pending_tool_call_ids = []
+                tool_call_counter = 0
 
                 if "conversations" in json_data:
                     conversations = json_data["conversations"]
@@ -913,13 +906,57 @@ class LLMJudgeValidationModule(BaseValidationModule):
                         for msg in conversations:
                             role = msg.get("role", "")
                             content = msg.get("content", "").strip()
-                            if role in ["user", "assistant", "function_call"] and content:
+                            if not content:
+                                continue
+
+                            if role == "function_call":
+                                tool_call_counter += 1
+                                tool_call_id = f"call_{tool_call_counter}"
+                                try:
+                                    call_data = json.loads(content)
+                                    tool_call_msg = {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                            {
+                                                "id": tool_call_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": call_data.get("name", ""),
+                                                    "arguments": call_data.get("arguments", {}),
+                                                },
+                                            }
+                                        ],
+                                    }
+                                    conversation_to_process.append(tool_call_msg)
+                                except (json.JSONDecodeError, KeyError):
+                                    tool_call_id = None
+                                    conversation_to_process.append(
+                                        {"role": "assistant", "content": content}
+                                    )
+                                if tool_call_id:
+                                    pending_tool_call_ids.append(tool_call_id)
+
+                            elif role == "observation":
+                                if pending_tool_call_ids:
+                                    obs_tool_call_id = pending_tool_call_ids.pop(0)
+                                else:
+                                    obs_tool_call_id = "call_unknown"
+                                conversation_to_process.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": obs_tool_call_id,
+                                        "content": content,
+                                    }
+                                )
+
+                            elif role in ["user", "assistant"] and content:
                                 conversation_to_process.append({"role": role, "content": content})
 
                         if conversation_to_process:
                             last_msg = conversation_to_process[-1]
-                            if last_msg["role"] in ["assistant", "function_call"]:
-                                reference_response = last_msg["content"]
+                            if last_msg["role"] in ["assistant", "tool"]:
+                                reference_response = last_msg.get("content", "")
                                 conversation_to_process = conversation_to_process[:-1]
 
                         if "tools" in json_data:
