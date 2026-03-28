@@ -391,86 +391,70 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
     def _construct_conversation_template(
         self,
-        conversation: List[Dict[str, str]],
-        base_model: str,
+        conversation: Dict[str, Any],
+        base_model: str = "default",
     ) -> str:
-        """Construct conversation template using local template_dict (for local validation)."""
+        """Construct conversation template using tokenizer's apply_chat_template.
+        This matches the official FLock-validator approach, ensuring correct
+        formatting for each model architecture (ChatML for Qwen, etc.).
+        """
         try:
-            if base_model not in template_dict:
-                logger.info(f"Template {base_model} not found, using default")
-                base_model = "default"
-
-            template = template_dict[base_model]
-
-            conversation_parts = []
-
-            # Validate conversation structure
             if not isinstance(conversation, dict):
                 raise LLMJudgeException(
                     f"Conversation must be a dict, got {type(conversation)}"
                 )
-
             if "conversations" not in conversation:
                 raise LLMJudgeException(
                     f"Conversation dict must have 'conversations' key"
                 )
-
             if not conversation["conversations"]:
                 raise LLMJudgeException(f"Conversation 'conversations' list is empty")
 
-            # Use provided system_text or fall back to template default
-            if template.system_format:
-                system_prompt = (
-                    conversation["system"] if "system" in conversation else None
+            messages = []
+            if conversation.get("system"):
+                messages.append({"role": "system", "content": conversation["system"]})
+
+            messages += conversation["conversations"]
+
+            tools_for_template = conversation.get("tools", None)
+            if tools_for_template is not None:
+                try:
+                    if isinstance(tools_for_template, str):
+                        tools_for_template = json.loads(tools_for_template)
+                except Exception:
+                    pass
+
+            template_kwargs = dict(
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            if tools_for_template:
+                template_kwargs["tools"] = tools_for_template
+
+            # Disable thinking for Qwen3.5 models that support it
+            try:
+                template = self.hf_tokenizer.apply_chat_template(
+                    messages, enable_thinking=False, **template_kwargs
                 )
-                system_content = (
-                    system_prompt if system_prompt else "You are a helpful assistant."
+            except TypeError:
+                # Fallback for tokenizers that don't support enable_thinking
+                template = self.hf_tokenizer.apply_chat_template(
+                    messages, **template_kwargs
                 )
-                if system_content:
-                    formatted_system = template.system_format.format(
-                        content=system_content
-                    )
-                    conversation_parts.append(formatted_system)
 
-            # Multi-turn conversation: format each message according to template
-            for msg in conversation["conversations"]:
-                if (
-                    not isinstance(msg, dict)
-                    or "role" not in msg
-                    or "content" not in msg
-                ):
-                    logger.warning(f"Skipping invalid message: {msg}")
-                    continue
-
-                if msg["role"] == "user":
-                    user_text = template.user_format.format(
-                        content=msg["content"],
-                        stop_token=self.hf_tokenizer.eos_token,
-                    )
-                    conversation_parts.append(user_text)
-                elif msg["role"] == "assistant":
-                    assistant_text = template.assistant_format.format(
-                        content=msg["content"],
-                        stop_token=self.hf_tokenizer.eos_token,
-                    )
-                    conversation_parts.append(assistant_text)
-
-            conversation_format = "".join(conversation_parts)
-
-            if not conversation_format.strip():
-                logger.error(
-                    f"Empty template generated. Template: {base_model}, Conversation: {conversation}, Parts: {conversation_parts}"
-                )
+            if not template or not template.strip():
                 raise LLMJudgeException(
-                    f"Generated conversation template is empty after formatting"
+                    f"Empty conversation template generated"
                 )
 
+        except LLMJudgeException:
+            raise
         except Exception as e:
             raise LLMJudgeException(
                 f"Failed to construct conversation template: {e}"
             ) from e
 
-        return conversation_format
+        return template
 
     def _generate_response(
         self,
@@ -1513,7 +1497,12 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
         for gen_try in range(max_gen_try):
             logger.info(f"Generation attempt {gen_try + 1}/{max_gen_try} for {len(input_conversations)} conversations...")
-            batch_conversations = [item["conversation"] for item in input_conversations]
+            batch_conversations = []
+            for item in input_conversations:
+                conv = dict(item["conversation"])
+                if item.get("tools"):
+                    conv["tools"] = item["tools"]
+                batch_conversations.append(conv)
 
             for start_idx, batch_responses in self._generate_response_batched(
                 user_input=batch_conversations, base_model=base_model,
