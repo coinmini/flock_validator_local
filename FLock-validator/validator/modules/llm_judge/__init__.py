@@ -910,6 +910,8 @@ class LLMJudgeValidationModule(BaseValidationModule):
             f"  prompt_id={eval_args.get('prompt_id', 0)}\n"
             f"  conversation_context:\n{conversation_context}\n"
             f"{'-'*40}\n"
+            f"  tools:\n{tools if tools else 'None'}\n"
+            f"{'-'*40}\n"
             f"  assistant_response:\n{assistant_response}\n"
             f"{'-'*40}\n"
             f"  reference:\n{reference if reference else 'None'}\n"
