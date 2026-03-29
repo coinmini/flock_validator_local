@@ -1,0 +1,4 @@
+name: lora
+dependencies:
+  - numpy
+  - pandas
