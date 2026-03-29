@@ -655,7 +655,9 @@ class LLMJudgeValidationModule(BaseValidationModule):
                 for t_idx, tmpl in enumerate(batch_conversation_templates):
                     global_data_idx = i + t_idx
                     logger.info(
-                        f"[Data {global_data_idx}] SFT Input template (first 500 chars):\n{tmpl[:500]}"
+                        f"\n{'>'*80}\n"
+                        f"[Data {global_data_idx}] SFT Input template:\n{tmpl}\n"
+                        f"{'>'*80}"
                     )
 
                 model_inputs = self.hf_tokenizer(
@@ -708,7 +710,9 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
                     global_idx = i + j
                     logger.info(
-                        f"[Data {global_idx}] SFT Output (first 300 chars):\n{assistant_response[:300]}"
+                        f"\n{'<'*80}\n"
+                        f"[Data {global_idx}] SFT Output:\n{assistant_response}\n"
+                        f"{'<'*80}"
                     )
 
                 yield (i, batch_results)
@@ -1001,9 +1005,11 @@ class LLMJudgeValidationModule(BaseValidationModule):
                     "tools": tools_info,
                 })
                 logger.info(
+                    f"\n{'='*80}\n"
                     f"[Data {line_num}] Loaded: {len(conversation_to_process)} messages, "
-                    f"has_reference={reference_response is not None}, has_tools={tools_info is not None}, "
-                    f"user_query={conversation_to_process[0]['content'][:150]}..."
+                    f"has_reference={reference_response is not None}, has_tools={tools_info is not None}\n"
+                    f"  user_query: {conversation_to_process[0]['content']}\n"
+                    f"{'='*80}"
                 )
 
             except json.JSONDecodeError:
@@ -1375,13 +1381,15 @@ class LLMJudgeValidationModule(BaseValidationModule):
         last_user_msg = ""
         for msg in reversed(conversation_data.get("conversations", [])):
             if msg.get("role") == "user":
-                last_user_msg = msg["content"][:150]
+                last_user_msg = msg["content"]
                 break
         logger.info(
+            f"\n{'#'*80}\n"
             f"[Conv {conv_idx}] === Starting evaluation ===\n"
-            f"  User query: {last_user_msg}...\n"
+            f"  User query: {last_user_msg}\n"
             f"  Has reference: {reference is not None}\n"
-            f"  Has tools: {tools is not None}"
+            f"  Has tools: {tools is not None}\n"
+            f"{'#'*80}"
         )
 
         messages = self._construct_evaluation_prompt(
@@ -1394,11 +1402,15 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
         # Log what is being sent to judge models
         logger.info(
+            f"\n{'-'*80}\n"
             f"[Conv {conv_idx}] Evaluation input:\n"
             f"  prompt_id={eval_args.get('prompt_id', 0)}\n"
-            f"  conversation_context (first 500 chars): {conversation_context[:500]}\n"
-            f"  assistant_response (first 300 chars): {assistant_response[:300]}\n"
-            f"  reference (first 300 chars): {str(reference)[:300] if reference else 'None'}"
+            f"  conversation_context:\n{conversation_context}\n"
+            f"{'-'*40}\n"
+            f"  assistant_response:\n{assistant_response}\n"
+            f"{'-'*40}\n"
+            f"  reference:\n{reference if reference else 'None'}\n"
+            f"{'-'*80}"
         )
 
         conv_scores = []
@@ -1422,9 +1434,11 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
                 # Log each judge model's result
                 logger.info(
+                    f"\n{'·'*80}\n"
                     f"[Conv {conv_idx}] Judge result: model={selected_model}, try={try_num+1}/{max_eval_try}, "
-                    f"score={parsed_result['score']}, confidence={parsed_result['confidence']}, "
-                    f"raw_response (first 200 chars): {str(response)[:200]}"
+                    f"score={parsed_result['score']}, confidence={parsed_result['confidence']}\n"
+                    f"  raw_response:\n{response}\n"
+                    f"{'·'*80}"
                 )
 
                 conv_scores.append(parsed_result["score"])
