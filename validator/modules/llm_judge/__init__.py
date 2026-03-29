@@ -652,6 +652,12 @@ class LLMJudgeValidationModule(BaseValidationModule):
                         raise LLMJudgeException("Empty conversation template generated")
                     batch_conversation_templates.append(template)
 
+                for t_idx, tmpl in enumerate(batch_conversation_templates):
+                    global_data_idx = i + t_idx
+                    logger.info(
+                        f"[Data {global_data_idx}] SFT Input template (first 500 chars):\n{tmpl[:500]}"
+                    )
+
                 model_inputs = self.hf_tokenizer(
                     batch_conversation_templates,
                     return_tensors="pt",
@@ -701,9 +707,9 @@ class LLMJudgeValidationModule(BaseValidationModule):
                     batch_results.append(assistant_response)
 
                     global_idx = i + j
-                    if global_idx < 3:
-                        preview = assistant_response[:500] + "..." if len(assistant_response) > 500 else assistant_response
-                        logger.info(f"[Sample Generation {global_idx + 1}] Response preview:\n{preview}")
+                    logger.info(
+                        f"[Data {global_idx}] SFT Output (first 300 chars):\n{assistant_response[:300]}"
+                    )
 
                 yield (i, batch_results)
 
@@ -994,6 +1000,11 @@ class LLMJudgeValidationModule(BaseValidationModule):
                     "reference": reference_response,
                     "tools": tools_info,
                 })
+                logger.info(
+                    f"[Data {line_num}] Loaded: {len(conversation_to_process)} messages, "
+                    f"has_reference={reference_response is not None}, has_tools={tools_info is not None}, "
+                    f"user_query={conversation_to_process[0]['content'][:150]}..."
+                )
 
             except json.JSONDecodeError:
                 logger.warning(f"Warning: Invalid JSON on line {line_num}, skipping")
@@ -1312,7 +1323,7 @@ class LLMJudgeValidationModule(BaseValidationModule):
         ]
 
     def _parse_llm_response(
-        self, response: str, model_name: str = None
+        self, response: str, model_name: str = None, conv_idx: int = None
     ) -> Dict[str, Any]:
         result = {"score": 5.0, "confidence": 0, "reasoning": None}
 
@@ -1333,13 +1344,13 @@ class LLMJudgeValidationModule(BaseValidationModule):
             else:
                 # No JSON found in response
                 logger.error(
-                    f"Model '{model_name}' did not return valid JSON format. "
+                    f"[Conv {conv_idx}] Model '{model_name}' did not return valid JSON format. "
                     f"Response: {response[:200]}..."
                 )
                 return result
         except (json.JSONDecodeError, ValueError, KeyError) as e:
             logger.error(
-                f"Model '{model_name}' returned malformed JSON: {e}. "
+                f"[Conv {conv_idx}] Model '{model_name}' returned malformed JSON: {e}. "
                 f"Response: {response[:200]}..."
             )
             return result
@@ -1359,12 +1370,35 @@ class LLMJudgeValidationModule(BaseValidationModule):
         )
         reference = conversation_data.get("reference")
         tools = conversation_data.get("tools")
+
+        # Log evaluation entry with data identification
+        last_user_msg = ""
+        for msg in reversed(conversation_data.get("conversations", [])):
+            if msg.get("role") == "user":
+                last_user_msg = msg["content"][:150]
+                break
+        logger.info(
+            f"[Conv {conv_idx}] === Starting evaluation ===\n"
+            f"  User query: {last_user_msg}...\n"
+            f"  Has reference: {reference is not None}\n"
+            f"  Has tools: {tools is not None}"
+        )
+
         messages = self._construct_evaluation_prompt(
             conversation_context,
             eval_args.get("prompt_id", 0),
             reference,
             tools,
             assistant_response,
+        )
+
+        # Log what is being sent to judge models
+        logger.info(
+            f"[Conv {conv_idx}] Evaluation input:\n"
+            f"  prompt_id={eval_args.get('prompt_id', 0)}\n"
+            f"  conversation_context (first 500 chars): {conversation_context[:500]}\n"
+            f"  assistant_response (first 300 chars): {assistant_response[:300]}\n"
+            f"  reference (first 300 chars): {str(reference)[:300] if reference else 'None'}"
         )
 
         conv_scores = []
@@ -1383,7 +1417,14 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
                 response, selected_model = self._call_gpt(messages, model_eval_args)
                 parsed_result = self._parse_llm_response(
-                    response, model_name=selected_model
+                    response, model_name=selected_model, conv_idx=conv_idx
+                )
+
+                # Log each judge model's result
+                logger.info(
+                    f"[Conv {conv_idx}] Judge result: model={selected_model}, try={try_num+1}/{max_eval_try}, "
+                    f"score={parsed_result['score']}, confidence={parsed_result['confidence']}, "
+                    f"raw_response (first 200 chars): {str(response)[:200]}"
                 )
 
                 conv_scores.append(parsed_result["score"])
