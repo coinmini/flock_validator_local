@@ -845,9 +845,14 @@ class LLMJudgeValidationModule(BaseValidationModule):
 
         selected_model, model_params = self._parse_model_name_to_params(eval_model)
 
-        # Patch: kimi-k2.5 and kimi-k2.5-thinking both require temperature=1
+        # Patch: kimi-k2.5 temperature handling
         if eval_model in ("kimi-k2.5", "kimi-k2.5-thinking"):
-            temperature = 1
+            # FLock platform proxy requires temperature=0.6
+            # Direct Moonshot API requires temperature=1
+            if selected_model in self.model_clients:
+                temperature = 1  # Direct API
+            else:
+                temperature = 0.6  # FLock platform proxy
 
         api_model_name = self.model_name_map.get(selected_model, selected_model)
         adapted_messages = self._adapt_messages_for_model(eval_model, messages)
